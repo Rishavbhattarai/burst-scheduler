@@ -1,0 +1,168 @@
+"""SQLite job store. Only the controller writes to it."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+from collections.abc import Iterable
+
+from .models import Job, JobEvent, JobState
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS jobs (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    command       TEXT NOT NULL,      -- JSON list
+    image         TEXT NOT NULL,
+    cpu           REAL NOT NULL,
+    memory_mb     INTEGER NOT NULL,
+    est_runtime_s REAL,
+    priority      INTEGER NOT NULL,
+    deadline_s    REAL,
+    timeout_s     REAL NOT NULL,
+    state         TEXT NOT NULL,
+    backend       TEXT,
+    worker        TEXT,
+    submitted_at  REAL NOT NULL,
+    dispatched_at REAL,
+    started_at    REAL,
+    finished_at   REAL,
+    exit_code     INTEGER,
+    error         TEXT,
+    output_tail   TEXT,
+    attempts      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state, priority DESC, submitted_at);
+"""
+
+COLUMNS = [
+    "id", "name", "command", "image", "cpu", "memory_mb", "est_runtime_s", "priority", "deadline_s",
+    "timeout_s", "state", "backend", "worker", "submitted_at", "dispatched_at", "started_at",
+    "finished_at", "exit_code", "error", "output_tail", "attempts",
+]
+
+
+class JobStore:
+    def __init__(self, path: str = ":memory:"):
+        self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self.db.row_factory = sqlite3.Row
+        if path != ":memory:":
+            self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.executescript(SCHEMA)
+
+    # -- reading ---------------------------------------------------------------------------------------
+
+    @staticmethod
+    def _to_job(row: sqlite3.Row) -> Job:
+        data = dict(row)
+        data["command"] = json.loads(data["command"])
+        return Job(**data)
+
+    def get(self, job_id: str) -> Job | None:
+        row = self.db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        return self._to_job(row) if row else None
+
+    def list(self, state: JobState | None = None, limit: int = 100) -> list[Job]:
+        if state is None:
+            rows = self.db.execute("SELECT * FROM jobs ORDER BY submitted_at DESC LIMIT ?", (limit,))
+        else:
+            rows = self.db.execute(
+                "SELECT * FROM jobs WHERE state = ? ORDER BY submitted_at DESC LIMIT ?", (state.value, limit)
+            )
+        return [self._to_job(r) for r in rows]
+
+    def queued(self) -> list[Job]:
+        """Queued jobs in the order they should run: priority, then first come first served."""
+        rows = self.db.execute(
+            "SELECT * FROM jobs WHERE state = ? ORDER BY priority DESC, submitted_at", (JobState.QUEUED.value,)
+        )
+        return [self._to_job(r) for r in rows]
+
+    def count_by_state(self) -> dict[str, int]:
+        counts = {s.value: 0 for s in JobState}
+        for row in self.db.execute("SELECT state, COUNT(*) AS n FROM jobs GROUP BY state"):
+            counts[row["state"]] = row["n"]
+        return counts
+
+    def dispatched_not_started(self, backend: str) -> int:
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM jobs WHERE state = ? AND backend = ?", (JobState.DISPATCHED.value, backend)
+        ).fetchone()
+        return row[0]
+
+    def recent_waits(self, since_s: float = 300, now: float | None = None) -> list[float]:
+        """Wait times (start - submit) of jobs that started in the last since_s seconds."""
+        now = now or time.time()
+        rows = self.db.execute(
+            "SELECT started_at - submitted_at FROM jobs WHERE started_at >= ?", (now - since_s,)
+        )
+        return [r[0] for r in rows]
+
+    def recent_runtimes(self, limit: int = 50) -> list[float]:
+        rows = self.db.execute(
+            "SELECT finished_at - started_at FROM jobs WHERE state = ? AND started_at IS NOT NULL "
+            "ORDER BY finished_at DESC LIMIT ?",
+            (JobState.SUCCEEDED.value, limit),
+        )
+        return [r[0] for r in rows]
+
+    # -- writing ---------------------------------------------------------------------------------------
+
+    def add(self, job: Job) -> Job:
+        data = job.model_dump(mode="json")
+        data["command"] = json.dumps(data["command"])
+        placeholders = ", ".join("?" for _ in COLUMNS)
+        self.db.execute(f"INSERT INTO jobs ({', '.join(COLUMNS)}) VALUES ({placeholders})",
+                        [data[c] for c in COLUMNS])
+        return job
+
+    def _update(self, job_id: str, where_states: Iterable[JobState], **fields) -> bool:
+        """Update fields if the job is in one of where_states. Returns whether a row changed."""
+        states = [s.value for s in where_states]
+        assignments = ", ".join(f"{k} = ?" for k in fields)
+        values = [v.value if isinstance(v, JobState) else v for v in fields.values()]
+        cur = self.db.execute(
+            f"UPDATE jobs SET {assignments} WHERE id = ? AND state IN ({', '.join('?' for _ in states)})",
+            [*values, job_id, *states],
+        )
+        return cur.rowcount == 1
+
+    def mark_dispatched(self, job_id: str, backend: str, now: float | None = None) -> bool:
+        return self._update(
+            job_id, [JobState.QUEUED],
+            state=JobState.DISPATCHED, backend=backend, dispatched_at=now or time.time(),
+        )
+
+    def cancel(self, job_id: str, now: float | None = None) -> bool:
+        return self._update(
+            job_id, [JobState.QUEUED, JobState.DISPATCHED, JobState.RUNNING],
+            state=JobState.CANCELLED, finished_at=now or time.time(),
+        )
+
+    def apply_event(self, event: JobEvent) -> bool:
+        """
+        Apply a worker event. Events can arrive twice (at-least-once delivery) or after a
+        cancellation, so each transition only happens from the states it is valid in.
+        """
+        if event.kind == "started":
+            job = self.get(event.job_id)
+            if job is None:
+                return False
+            if job.state == JobState.RUNNING and job.worker != event.worker:
+                # redelivered after its worker disappeared: another attempt (keep the first start
+                # time, so wait statistics measure the time until the job first started)
+                return self._update(event.job_id, [JobState.RUNNING], worker=event.worker,
+                                    attempts=job.attempts + 1)
+            return self._update(
+                event.job_id, [JobState.QUEUED, JobState.DISPATCHED],
+                state=JobState.RUNNING, worker=event.worker, started_at=event.ts, attempts=job.attempts + 1,
+            )
+        if event.kind == "finished":
+            state = JobState.SUCCEEDED if event.exit_code == 0 else JobState.FAILED
+            return self._update(
+                event.job_id, [JobState.DISPATCHED, JobState.RUNNING],
+                state=state, worker=event.worker, finished_at=event.ts, exit_code=event.exit_code,
+                error=event.error, output_tail=event.output_tail,
+            )
+        raise ValueError(f"unknown event kind {event.kind!r}")
