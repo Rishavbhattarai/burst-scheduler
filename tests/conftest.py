@@ -16,6 +16,7 @@ import pytest
 
 from burst.config import Settings
 from burst.controller import create_app
+from burst.policy import PolicyConfig
 from burst.worker import Worker
 
 NATS_SERVER = shutil.which("nats-server")
@@ -66,11 +67,13 @@ def nats_url(tmp_path):
 class Cluster:
     """Controller + HTTP client + helpers to start workers, all against one nats-server."""
 
-    def __init__(self, nats_url: str, tmp_path, api_token: str = ""):
+    def __init__(self, nats_url: str, tmp_path, api_token: str = "", policy: PolicyConfig | None = None,
+                 backends: dict | None = None):
         self.nats_url = nats_url
         self.tmp_path = tmp_path
         self.settings = Settings(nats_url=nats_url, db_path=str(tmp_path / "burst.db"), api_token=api_token,
-                                 schedule_interval_s=0.05, worker_timeout_s=3)
+                                 schedule_interval_s=0.05, worker_timeout_s=3, cloud_poll_interval_s=0.1,
+                                 policy=policy or PolicyConfig(), backends=backends or {})
         self.worker_tasks: list[tuple[Worker, asyncio.Task]] = []
         self.worker_procs: list[subprocess.Popen] = []
 

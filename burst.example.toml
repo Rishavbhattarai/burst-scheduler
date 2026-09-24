@@ -1,0 +1,41 @@
+# Copy to burst.toml and start the controller with BURST_CONFIG=burst.toml.
+# Prices are dollars per vCPU-hour and per GB-hour; set them to what your cloud charges.
+
+[policy]
+burst_threshold_s = 60      # burst when a job's expected total wait reaches this
+mode = "balanced"           # cheapest | balanced | fastest
+# value_per_hour = 2.0      # $ an hour of saved waiting is worth (overrides the mode)
+max_cloud_jobs = 10
+max_spend_per_hour = 5.0
+daily_budget = 50.0
+
+# Runs jobs on this machine after a delay: lets you try bursting without a cloud account.
+[backends.simulated]
+kind = "simulated"
+startup_s = 5
+max_jobs = 8
+cpu_hour = 0.04
+gb_hour = 0.004
+
+# Kubernetes Jobs, e.g. on a local kind cluster or EKS/GKE/AKS.
+[backends.kubernetes]
+enabled = false
+kind = "kubernetes"
+context = "kind-burst"      # kubeconfig context (or in_cluster = true)
+namespace = "default"
+startup_s = 15
+max_jobs = 20
+cpu_hour = 0.048
+gb_hour = 0.006
+
+# AWS Batch: the job queue and job definition must exist; credentials come from the usual AWS chain.
+[backends.aws_batch]
+enabled = false
+kind = "aws_batch"
+region = "us-east-1"
+job_queue = "burst-queue"
+job_definition = "burst-job"
+startup_s = 90
+max_jobs = 50
+cpu_hour = 0.0405           # Fargate on-demand, us-east-1
+gb_hour = 0.00445

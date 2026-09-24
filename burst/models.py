@@ -49,6 +49,12 @@ class Job(JobSubmit):
     error: str | None = None
     output_tail: str | None = None
     attempts: int = 0
+    # cloud bursting
+    external_id: str | None = None        # the backend's id (Kubernetes job name, AWS Batch job id, ...)
+    price_per_hour: float | None = None   # what the backend charges for this job's resources
+    cost_estimate: float | None = None    # estimated at dispatch
+    cost: float | None = None             # from the actual run time
+    decision: str | None = None           # why the scheduler placed (or kept) the job where it is
 
     def wait_s(self, now: float | None = None) -> float:
         """Time spent waiting before starting (so far, if it has not started)."""

@@ -17,6 +17,8 @@ services:
     command: ["burst-controller"]
     environment:
       BURST_NATS_URL: nats://nats:4222
+      # burst policy and cloud backends; the example bursts to the simulated backend
+      BURST_CONFIG: ${BURST_CONFIG:-/app/burst.example.toml}
     volumes: [controller-data:/data]
     ports: ["8000:8000"]
     depends_on:

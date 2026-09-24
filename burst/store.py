@@ -31,7 +31,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     exit_code     INTEGER,
     error         TEXT,
     output_tail   TEXT,
-    attempts      INTEGER NOT NULL DEFAULT 0
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    external_id   TEXT,
+    price_per_hour REAL,
+    cost_estimate REAL,
+    cost          REAL,
+    decision      TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state, priority DESC, submitted_at);
 """
@@ -40,7 +45,12 @@ COLUMNS = [
     "id", "name", "command", "image", "cpu", "memory_mb", "est_runtime_s", "priority", "deadline_s",
     "timeout_s", "state", "backend", "worker", "submitted_at", "dispatched_at", "started_at",
     "finished_at", "exit_code", "error", "output_tail", "attempts",
+    "external_id", "price_per_hour", "cost_estimate", "cost", "decision",
 ]
+
+# columns added after the first release: (name, SQL type)
+MIGRATIONS = [("external_id", "TEXT"), ("price_per_hour", "REAL"), ("cost_estimate", "REAL"), ("cost", "REAL"),
+              ("decision", "TEXT")]
 
 
 class JobStore:
@@ -50,6 +60,10 @@ class JobStore:
         if path != ":memory:":
             self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        existing = {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)")}
+        for column, sql_type in MIGRATIONS:
+            if column not in existing:
+                self.db.execute(f"ALTER TABLE jobs ADD COLUMN {column} {sql_type}")
 
     # -- reading ---------------------------------------------------------------------------------------
 
@@ -128,11 +142,38 @@ class JobStore:
         )
         return cur.rowcount == 1
 
-    def mark_dispatched(self, job_id: str, backend: str, now: float | None = None) -> bool:
+    def mark_dispatched(self, job_id: str, backend: str, now: float | None = None, **cloud) -> bool:
+        """Queued -> dispatched. `cloud` can set external_id, price_per_hour, cost_estimate, decision."""
+        allowed = {"external_id", "price_per_hour", "cost_estimate", "decision"}
+        if not set(cloud) <= allowed:
+            raise TypeError(f"unexpected fields {set(cloud) - allowed}")
         return self._update(
             job_id, [JobState.QUEUED],
-            state=JobState.DISPATCHED, backend=backend, dispatched_at=now or time.time(),
+            state=JobState.DISPATCHED, backend=backend, dispatched_at=now or time.time(), **cloud,
         )
+
+    def set_decision(self, job_id: str, decision: str) -> None:
+        """Record why a queued job is still waiting (only written when it changes)."""
+        self.db.execute("UPDATE jobs SET decision = ? WHERE id = ? AND state = ? AND decision IS NOT ?",
+                        (decision, job_id, JobState.QUEUED.value, decision))
+
+    def set_cost(self, job_id: str, cost: float) -> None:
+        self.db.execute("UPDATE jobs SET cost = ? WHERE id = ?", (cost, job_id))
+
+    def active_cloud_jobs(self) -> list[Job]:
+        """Dispatched or running jobs on a backend other than the local workers."""
+        rows = self.db.execute(
+            "SELECT * FROM jobs WHERE backend IS NOT NULL AND backend != 'local' AND state IN (?, ?)",
+            (JobState.DISPATCHED.value, JobState.RUNNING.value),
+        )
+        return [self._to_job(r) for r in rows]
+
+    def cloud_cost_since(self, since: float) -> float:
+        """Actual cost of cloud jobs that finished since `since`."""
+        row = self.db.execute(
+            "SELECT COALESCE(SUM(cost), 0) FROM jobs WHERE backend != 'local' AND finished_at >= ?", (since,)
+        ).fetchone()
+        return row[0]
 
     def cancel(self, job_id: str, now: float | None = None) -> bool:
         return self._update(
