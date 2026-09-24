@@ -2,18 +2,19 @@
 
 [![CI](https://github.com/Rishavbhattarai/burst-scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/Rishavbhattarai/burst-scheduler/actions/workflows/ci.yml)
 
-A small job queue that runs work on local machines and, when jobs wait too long, bursts them to
-cloud workers (Kubernetes or AWS Batch), with rules that trade cost against speed and a live
-dashboard. Inspired by Princeton's Orchestrated Burst Compute and the HydroGEN stack: Docker, NATS,
-a REST API and a React UI.
+burst-scheduler is a small job queue. It runs jobs on local machines, and when a job would wait too
+long, it sends the job to cloud workers on Kubernetes or AWS Batch. Rules decide when the time saved is
+worth the cloud cost, and a live dashboard shows where every job ran and why. The design follows
+Princeton's Orchestrated Burst Compute and uses the HydroGEN stack: Docker, NATS, a REST API and a
+React UI.
 
-![Dashboard: 4 local slots full, overflow running on the cloud backend, spend rate and job decisions](docs/dashboard.png)
+![Dashboard with 4 local slots full, overflow running on the cloud backend, the spend rate and each job's decision](docs/dashboard.png)
 
-**Try it in one minute:**
+## Quick start
 
 ```bash
 docker compose up --build            # NATS, controller + dashboard on http://localhost:8000, 2 workers
-python3 scripts/load.py              # waves of jobs: watch them spill over to the (simulated) cloud
+python3 scripts/load.py              # waves of jobs that spill over to the simulated cloud
 ```
 
 ## How it works
@@ -29,48 +30,50 @@ python3 scripts/load.py              # waves of jobs: watch them spill over to t
              └── submit / poll / cancel ──▶ Kubernetes Jobs · AWS Batch · simulated cloud
 ```
 
-- **The controller holds the queue.** Jobs wait in SQLite, not in NATS. Workers announce their free slots
-  in heartbeats, and the scheduler only dispatches a job when a local slot is free. Because waiting jobs
-  have not been handed to anyone yet, the scheduler can still decide to send them somewhere else, which
-  is what the cloud burst relies on.
-- **At-least-once, but safe.** Dispatches and job events go through JetStream, so nothing is lost if the
-  controller restarts. A worker acknowledges a job only when it finishes (and sends in-progress pings while
-  it runs), so a job whose worker crashes is redelivered to another worker. Dispatches carry
-  `Nats-Msg-Id = job id`, so JetStream drops a duplicate if the controller dies between publishing and
-  recording the dispatch. Job state changes are idempotent: duplicate or late events are ignored.
-- **Priorities:** higher `priority` first, then first come, first served.
-- **Cancellation:** a queued job is removed from the queue; a running job's whole process group is killed,
-  and a cloud job is deleted/terminated on its backend.
+The controller holds the queue in SQLite. Workers report their free slots in heartbeats, and the
+scheduler sends a job to NATS only when a local slot is free. Until then nobody has the job, so the
+scheduler can still send it to the cloud instead.
+
+Dispatches and job events go through JetStream, so a controller restart loses nothing. A worker
+acknowledges a job only when it finishes and sends in-progress pings while it runs. If the worker
+crashes, JetStream redelivers the job to another worker. Each dispatch carries `Nats-Msg-Id = job id`,
+so if the controller dies between publishing a job and recording it, JetStream drops the second copy.
+The store ignores duplicate and late events, so a repeated message never moves a job backwards.
+
+Jobs with a higher `priority` run first, then the oldest. Cancelling a queued job removes it from the
+queue. Cancelling a running job kills its whole process group, or deletes it on its cloud backend.
 
 ## Bursting to the cloud
 
-Every scheduling pass first fills free local slots. Each job that is still waiting then goes through
-the policy (`burst/policy.py`), which either sends it to a cloud backend or records why it stays:
+Each scheduling pass fills the free local slots first. For every job still waiting, the policy
+(`burst/policy.py`) either picks a cloud backend or records why the job stays:
 
-1. **Trigger:** expected total wait (time waited so far + predicted remaining local wait) reaches
-   `burst_threshold_s`, or the job would miss its `deadline_s` locally. The remaining wait is predicted
-   from the job's queue position, the number of local slots and the median recent run time.
-2. **Guardrails:** a backend needs free capacity (`max_jobs`), must keep the cloud spend rate under
-   `max_spend_per_hour`, and its cost estimate must fit in what is left of `daily_budget`. At most
-   `max_cloud_jobs` run in the cloud at once.
-3. **Deadlines first:** if the job misses its deadline locally, the cheapest backend that meets it wins.
-4. **Cost vs speed:** otherwise waiting time saved is worth `value_per_hour` dollars per hour (doubled
-   for every +10 priority), and the backend with the largest positive net benefit (value of time saved
-   minus cost) is used. Modes: `cheapest` (never burst just for speed), `balanced` ($2/h),
-   `fastest` (always burst once the threshold is reached).
+1. A job becomes a candidate when its expected total wait (time waited so far plus the predicted
+   remaining local wait) reaches `burst_threshold_s`, or when it would miss its `deadline_s` locally.
+   The scheduler predicts the remaining wait from the job's queue position, the number of local slots
+   and the median recent run time.
+2. A backend qualifies only if it has free capacity (`max_jobs`), adding the job keeps the cloud spend
+   rate under `max_spend_per_hour`, and the job's estimated cost fits in what is left of `daily_budget`.
+   At most `max_cloud_jobs` run in the cloud at once.
+3. If the job would miss its deadline locally, the cheapest backend that meets the deadline wins.
+4. Otherwise each hour of waiting saved is worth `value_per_hour` dollars, doubled for every +10
+   priority, and the backend with the largest positive net benefit (value of the time saved minus the
+   cost) wins. The `cheapest` mode never bursts for speed alone, `balanced` values waiting at $2/h, and
+   `fastest` bursts whenever the threshold is reached.
 
-Every job carries the reason in `decision`, e.g.
+The scheduler writes its reason into each job's `decision` field, for example
 `expected wait 20s ≥ 15s: saves 20s for $0.0012 on kubernetes` or `cloud job limit reached (2)`.
-Cost is estimated at dispatch and charged from the actual time between submission and the end.
+The controller estimates the cost at dispatch and charges the actual time from submission to finish.
 
 | backend | how | notes |
 |---|---|---|
-| `kubernetes` | one `batch/v1` Job per burst job: CPU/memory requests and limits, `activeDeadlineSeconds` = timeout, no retries, TTL cleanup | exit code and log tail are read back from the pod |
-| `aws_batch` | `submit_job` with command/vCPU/memory overrides, `describe_jobs`, `terminate_job` | job queue and job definition must exist; the image comes from the job definition |
-| `simulated` | runs the job on the controller's machine after `startup_s` and bills it | for demos without a cloud account; results are labelled with the backend name |
+| `kubernetes` | one `batch/v1` Job per burst job: CPU/memory requests and limits, `activeDeadlineSeconds` = timeout, no retries, TTL cleanup | reads the exit code and log tail back from the pod |
+| `aws_batch` | `submit_job` with command/vCPU/memory overrides, `describe_jobs`, `terminate_job` | the job queue and job definition must exist; the image comes from the job definition |
+| `simulated` | runs the job on the controller's machine after `startup_s` and bills it | for demos without a cloud account; jobs show the backend name, so simulated runs are always labelled |
 
-Configure them in a TOML file (`BURST_CONFIG=burst.toml`, see [burst.example.toml](burst.example.toml)).
-The policy can also be read and changed at runtime with `GET`/`PUT /policy`.
+Configure the policy and backends in a TOML file (`BURST_CONFIG=burst.toml`, see
+[burst.example.toml](burst.example.toml)). You can also read and change the policy at runtime with
+`GET`/`PUT /policy`.
 
 To try Kubernetes locally with [kind](https://kind.sigs.k8s.io/):
 
@@ -82,18 +85,17 @@ BURST_CONFIG=burst.toml .venv/bin/burst-controller
 
 ## Dashboard
 
-`dashboard/` is a React + TypeScript app (Vite). The controller serves the built app at `/`, so
-`docker compose up` gives you everything on port 8000. It shows:
+`dashboard/` is a React + TypeScript app built with Vite. The controller serves the built app at `/`,
+so `docker compose up` puts the API and the dashboard on port 8000. The dashboard shows:
 
-- **Summary tiles:** queued jobs and the oldest wait, p50/p95 wait over the last 5 minutes, free local
-  slots with the estimated wait for a new job, cloud jobs per backend, and today's spend against the
-  daily budget.
-- **Charts** from `GET /stats/history` (sampled every 2 s, 30 minutes kept): jobs queued / running
-  locally / running in the cloud, and the cloud spend rate. Hover (or focus and use the arrow keys) for
-  every series at that moment; each chart also has a table view.
-- **Policy controls** (`PUT /policy`): mode, threshold, cloud job limit, spend cap and daily budget,
-  applied on the next scheduling pass.
-- **Workers, backends and recent jobs** with where each job ran, its cost, and the scheduler's reason.
+- queued jobs and the oldest wait, p50 and p95 wait over the last 5 minutes, free local slots with
+  the estimated wait for a new job, cloud jobs per backend, and today's spend against the daily budget
+- charts of jobs queued, running locally and running in the cloud, and of the cloud spend rate, from
+  `GET /stats/history` (sampled every 2 s, 30 minutes kept); hover, or focus a chart and use the arrow
+  keys, to read every series at one moment, or open the table view under each chart
+- policy controls for the mode, threshold, cloud job limit, spend cap and daily budget, which apply on
+  the next scheduling pass
+- workers, backends and recent jobs, with where each job ran, what it cost and the scheduler's reason
 
 Light and dark mode follow the system setting. For development:
 
@@ -112,10 +114,10 @@ docker compose up --build              # NATS, controller on :8000, 2 workers wi
 docker compose up --scale worker=4     # more local capacity
 ```
 
-The compose file loads `burst.example.toml`, so jobs that would wait more than 60 s locally are
-sent to the simulated cloud. Point `BURST_CONFIG` at your own file to use Kubernetes or AWS Batch.
+The compose file loads `burst.example.toml`, so jobs that would wait more than 60 s locally go to the
+simulated cloud. Point `BURST_CONFIG` at your own file to use Kubernetes or AWS Batch.
 
-Without Docker (needs `nats-server`, e.g. `brew install nats-server`):
+Without Docker you need `nats-server` (for example `brew install nats-server`):
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[dev]"
@@ -124,7 +126,7 @@ nats-server -js &
 .venv/bin/burst-worker --slots 2 &
 ```
 
-Generate load (standard library only; `--help` for options):
+Generate load with `scripts/load.py`, which uses only the standard library (`--help` lists the options):
 
 ```bash
 python3 scripts/load.py --waves 6 --jobs 20 --min-s 10 --max-s 40
@@ -159,7 +161,7 @@ Interactive API docs are at <http://localhost:8000/docs>.
 | GET | `/healthz` | controller health (no auth) |
 
 Set `BURST_API_TOKEN` to require `Authorization: Bearer <token>`. Jobs run arbitrary commands on the
-workers, so only expose the API on a trusted network.
+workers, so expose the API only on a trusted network.
 
 ## Configuration
 
@@ -171,31 +173,31 @@ workers, so only expose the API on a trusted network.
 | `BURST_SCHEDULE_INTERVAL` | `0.5` | seconds between scheduling passes |
 | `BURST_WORKER_TIMEOUT` | `10` | seconds without a heartbeat before a worker counts as gone |
 | `BURST_WORKER_SLOTS` | CPU count | jobs a worker runs at once |
-| `BURST_ACK_WAIT` | `30` | seconds before an unacknowledged job is redelivered |
-| `BURST_CONFIG` | (none) | TOML file with `[policy]` and `[backends.*]`; without it everything runs locally |
+| `BURST_ACK_WAIT` | `30` | seconds before JetStream redelivers an unacknowledged job |
+| `BURST_CONFIG` | (none) | TOML file with `[policy]` and `[backends.*]`; without it every job runs locally |
 | `BURST_CLOUD_POLL_INTERVAL` | `2` | seconds between cloud status checks |
 | `BURST_DASHBOARD_DIR` | `dashboard/dist` | built dashboard served at `/` (skipped if missing) |
 
 ## Tests
 
 ```bash
-.venv/bin/pytest                                  # ~75 tests, ~35 s
-BURST_K8S_CONTEXT=kind-burst .venv/bin/pytest -m k8s   # against a real cluster
+.venv/bin/pytest                                        # 71 tests, about 40 s
+BURST_K8S_CONTEXT=kind-burst .venv/bin/pytest -m k8s    # against a real cluster
 ```
 
-- Unit tests for the store, scheduler and every policy rule, the Kubernetes manifest and status mapping,
-  and the AWS Batch calls (checked against the real API schema with botocore's `Stubber`).
-- End-to-end tests start a real `nats-server` (skipped if it is not installed) and check job outcomes,
-  priority order, cancellation, redelivery after `kill -9` of a worker, events surviving a controller
-  restart, and bursting: threshold, job limit, deadlines, cheapest mode, cloud cancellation, a failing
-  backend and runtime policy changes.
-- `-m k8s` runs jobs on a real cluster (kind): success, exit codes, deadlines, cancellation, and the
+- Unit tests cover the store, the scheduler, every policy rule, the Kubernetes manifest and status
+  mapping, and the AWS Batch calls, which botocore's `Stubber` checks against the real API schema.
+- End-to-end tests start a real `nats-server` (they skip if it is not installed). They check job
+  outcomes, priority order, cancellation, redelivery after `kill -9` of a worker, events surviving a
+  controller restart, and bursting: the threshold, the job limit, deadlines, cheapest mode, cloud
+  cancellation, a failing backend and policy changes at runtime.
+- `-m k8s` runs jobs on a real kind cluster: success, exit codes, deadlines, cancellation, and the
   controller bursting into Kubernetes.
 
-GitHub Actions runs four jobs on every push: lint + tests on Python 3.11 and 3.13 with a real
-nats-server, the Kubernetes tests on a kind cluster, the dashboard type check and build, and a
-`docker compose` smoke test (`scripts/smoke.sh`) that sends a wave of jobs and checks they finish on
-both the local workers and the simulated cloud.
+GitHub Actions runs five jobs on every push: lint and tests on Python 3.11 and on 3.13, both with a real
+nats-server; the Kubernetes tests on a kind cluster; the dashboard type check and build; and a
+`docker compose` smoke test (`scripts/smoke.sh`) that sends a wave of jobs and checks that they finish
+on both the local workers and the simulated cloud.
 
 ## Layout
 
