@@ -97,6 +97,14 @@ class SimulatedBackend(CloudBackend):
                     del self._jobs[external_id]
         return result
 
+    def close(self) -> None:
+        """The simulated jobs are child processes of the controller: stop them with it."""
+        with self._lock:
+            for sim in self._jobs.values():
+                self._kill(sim)
+                sim.output.close()
+            self._jobs.clear()
+
     def cancel(self, external_id: str) -> None:
         with self._lock:
             sim = self._jobs.get(external_id)

@@ -99,6 +99,14 @@ class JobStore:
             counts[row["state"]] = row["n"]
         return counts
 
+    def active_by_backend(self) -> dict[str, int]:
+        """Dispatched or running jobs per backend."""
+        rows = self.db.execute(
+            "SELECT backend, COUNT(*) FROM jobs WHERE state IN (?, ?) GROUP BY backend",
+            (JobState.DISPATCHED.value, JobState.RUNNING.value),
+        )
+        return {r[0]: r[1] for r in rows}
+
     def dispatched_not_started(self, backend: str) -> int:
         row = self.db.execute(
             "SELECT COUNT(*) FROM jobs WHERE state = ? AND backend = ?", (JobState.DISPATCHED.value, backend)

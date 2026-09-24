@@ -1,4 +1,4 @@
-# Local cluster: NATS (JetStream), the controller (REST API on :8000) and two workers.
+# Local cluster: NATS (JetStream), the controller (REST API and dashboard on :8000) and two workers.
 #   docker compose up --build
 #   docker compose up --scale worker=4    # more local capacity
 services:

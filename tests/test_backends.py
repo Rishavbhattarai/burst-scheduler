@@ -174,3 +174,12 @@ def test_simulated_backend_lifecycle():
     wait_for(sim, victim, "running")
     sim.cancel(victim)
     assert wait_for(sim, victim, "failed").error == "cancelled"
+
+
+def test_simulated_backend_close_stops_its_processes():
+    sim = create_backend("sim", {"kind": "simulated", "startup_s": 0})
+    external_id = sim.submit(Job(command=["sleep", "30"]))
+    wait_for(sim, external_id, "running")
+    proc = next(iter(sim._jobs.values())).proc
+    sim.close()
+    assert proc.poll() is not None and sim._jobs == {}

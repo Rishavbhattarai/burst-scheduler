@@ -60,6 +60,9 @@ class CloudBackend(ABC):
     def cancel(self, external_id: str) -> None:
         """Stop the job if it is still running."""
 
+    def close(self) -> None:  # noqa: B027 - optional hook, a no-op by default
+        """Called when the controller stops. Real cloud jobs keep running (polling resumes on restart)."""
+
     def describe(self) -> dict:
         return {"name": self.name, "kind": self.kind, "startup_s": self.startup_s, "max_jobs": self.max_jobs,
                 "cpu_hour": self.pricing.cpu_hour, "gb_hour": self.pricing.gb_hour}

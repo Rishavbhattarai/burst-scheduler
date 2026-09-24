@@ -10,12 +10,14 @@ import logging
 import os
 import statistics
 import time
-from collections import Counter
+from collections import Counter, deque
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from pathlib import Path
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi.staticfiles import StaticFiles
 from nats.errors import TimeoutError as NatsTimeoutError
 from pydantic import BaseModel, ConfigDict
 
@@ -30,6 +32,8 @@ from .store import JobStore
 log = logging.getLogger("burst.controller")
 
 SUBMIT_FAILURE_COOLDOWN_S = 30.0
+HISTORY_INTERVAL_S = 2.0
+HISTORY_SAMPLES = 900   # 30 minutes
 
 
 def start_of_day(now: float) -> float:
@@ -62,6 +66,7 @@ class Controller:
             name: create_backend(name, options) for name, options in settings.backends.items()
         }
         self.backend_cooldown: dict[str, float] = {}   # backend -> time until which it is skipped
+        self.history: deque[dict] = deque(maxlen=HISTORY_SAMPLES)
         self.tasks: list[asyncio.Task] = []
 
     async def start(self) -> None:
@@ -72,12 +77,15 @@ class Controller:
         self.events = await self.js.pull_subscribe(bus.EVENTS, durable=bus.CONTROLLER_CONSUMER,
                                                    stream=bus.EVENTS_STREAM)
         self.tasks = [asyncio.create_task(self._event_loop()), asyncio.create_task(self._schedule_loop()),
-                      asyncio.create_task(self._cloud_loop())]
+                      asyncio.create_task(self._cloud_loop()), asyncio.create_task(self._history_loop())]
 
     async def stop(self) -> None:
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
+        for backend in self.backends.values():
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(backend.close)
         # a pull subscription never finishes draining (nats-py), so remove it first
         with contextlib.suppress(Exception):
             await self.events.unsubscribe()
@@ -239,6 +247,28 @@ class Controller:
                 log.exception("scheduling failed")
             await asyncio.sleep(self.settings.schedule_interval_s)
 
+    # -- history for the dashboard ---------------------------------------------------------------------
+
+    def sample(self, now: float | None = None) -> dict:
+        now = now or time.time()
+        active = self.store.active_by_backend()
+        cloud = self.budget_state(now)
+        return {
+            "ts": now,
+            "queued": self.store.count_by_state()["queued"],
+            "local": active.get("local", 0),
+            "cloud": sum(n for backend, n in active.items() if backend != "local"),
+            "spend_rate_per_hour": cloud.spend_rate_per_hour,
+        }
+
+    async def _history_loop(self) -> None:
+        while True:
+            try:
+                self.history.append(self.sample())
+            except Exception:
+                log.exception("sampling history failed")
+            await asyncio.sleep(HISTORY_INTERVAL_S)
+
     # -- API helpers -----------------------------------------------------------------------------------
 
     async def submit(self, spec: JobSubmit) -> Job:
@@ -357,6 +387,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def get_stats() -> dict:
         return controller.stats()
 
+    @app.get("/stats/history", dependencies=auth)
+    async def get_history(since: float = 0) -> list[dict]:
+        """Samples every 2 s for the last 30 minutes (newer than `since`, a unix time)."""
+        return [h for h in controller.history if h["ts"] > since]
+
     @app.get("/policy", dependencies=auth)
     async def get_policy() -> dict:
         return asdict(controller.policy)
@@ -371,6 +406,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return [{**b.describe(), "active": active[b.name],
                  "cooling_down": controller.backend_cooldown.get(b.name, 0) > time.time()}
                 for b in controller.backends.values()]
+
+    # the dashboard (built with `npm run build` in dashboard/), mounted last so API routes win
+    if Path(settings.dashboard_dir, "index.html").is_file():
+        app.mount("/", StaticFiles(directory=settings.dashboard_dir, html=True), name="dashboard")
 
     return app
 

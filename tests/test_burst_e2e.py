@@ -146,3 +146,23 @@ async def test_policy_api(nats_url, tmp_path):
         assert [(b["name"], b["kind"], b["max_jobs"]) for b in backends] == [("sim", "simulated", 8)]
     finally:
         await cluster.close()
+
+
+async def test_history_samples(nats_url, tmp_path):
+    cluster = await make(nats_url, tmp_path, mode="fastest")
+    try:
+        cluster.start_worker("w1", slots=1)
+        await cluster.workers_alive(1)
+        local = await cluster.submit(command=SLEEP)
+        await cluster.wait_state(local["id"], "running")
+        cloud = await cluster.submit(command=SLEEP)
+        await cluster.wait_state(cloud["id"], "running")
+        sample = cluster.controller.sample()
+        assert (sample["local"], sample["cloud"], sample["queued"]) == (1, 1, 0)
+        assert sample["spend_rate_per_hour"] == pytest.approx(0.36)
+        cluster.controller.history.append(sample)
+        history = (await cluster.client.get("/stats/history", params={"since": sample["ts"] - 1})).json()
+        assert history[-1] == sample
+        assert (await cluster.client.get("/stats/history", params={"since": sample["ts"]})).json() == []
+    finally:
+        await cluster.close()

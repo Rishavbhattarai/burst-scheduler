@@ -24,6 +24,8 @@ class Settings:
     worker_timeout_s: float = field(default_factory=lambda: float(_env("WORKER_TIMEOUT", "10")))
     # how often cloud jobs are polled for status
     cloud_poll_interval_s: float = field(default_factory=lambda: float(_env("CLOUD_POLL_INTERVAL", "2")))
+    # built dashboard (dashboard/dist) served at / when the directory exists
+    dashboard_dir: str = field(default_factory=lambda: _env("DASHBOARD_DIR", "dashboard/dist"))
     # optional TOML file with [policy] and [backends.<name>] sections (see burst.example.toml)
     config_path: str = field(default_factory=lambda: _env("CONFIG", ""))
     policy: PolicyConfig = field(default_factory=PolicyConfig)
