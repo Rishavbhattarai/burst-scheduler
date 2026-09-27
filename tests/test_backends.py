@@ -7,7 +7,7 @@ import boto3
 import pytest
 from botocore.stub import Stubber
 
-from burst.backends import Pricing, create_backend
+from burst.backends import create_backend
 from burst.backends.aws_batch import AwsBatchBackend, status_from_description, submit_request
 from burst.backends.kubernetes import job_manifest, status_from_objects
 from burst.models import Job
@@ -17,7 +17,8 @@ JOB = Job(id="abc123", name="train", command=["python", "-c", "print(1)"], image
 
 
 def test_pricing():
-    assert Pricing(cpu_hour=0.05, gb_hour=0.01).per_hour(JOB) == pytest.approx(2 * 0.05 + 4 * 0.01)
+    sim = create_backend("sim", {"kind": "simulated", "cpu_hour": 0.05, "gb_hour": 0.01})
+    assert sim.price_per_hour(JOB) == pytest.approx(2 * 0.05 + 4 * 0.01)
 
 
 def test_unknown_backend_kind():

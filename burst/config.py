@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 
 from .policy import PolicyConfig
 
@@ -38,10 +38,6 @@ class Settings:
     def load_file(self, path: str) -> None:
         with open(path, "rb") as fh:
             data = tomllib.load(fh)
-        known = {f.name for f in fields(PolicyConfig)}
-        unknown = set(data.get("policy", {})) - known
-        if unknown:
-            raise ValueError(f"unknown [policy] settings in {path}: {sorted(unknown)}")
         self.policy = PolicyConfig(**data.get("policy", {}))
         self.backends = {name: opts for name, opts in data.get("backends", {}).items()
                          if opts.get("enabled", True)}

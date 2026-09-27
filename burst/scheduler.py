@@ -1,17 +1,14 @@
-"""Scheduling decisions (no I/O, so it can be tested directly).
+"""Local scheduling math (no I/O, so it can be tested directly): worker registry, free slots, wait estimate.
 
-The controller keeps the queue. Each tick it asks the scheduler which queued jobs to send
-where. In this version everything runs locally; the cloud backends and the cost/speed
-policy that decide when to spill over are added on top of plan().
+The controller keeps the queue; each tick it fills free local slots, then asks the policy about the rest.
 """
 
 from __future__ import annotations
 
 import statistics
 import time
-from dataclasses import dataclass, field
 
-from .models import Job, WorkerInfo
+from .models import WorkerInfo
 
 
 class WorkerRegistry:
@@ -44,33 +41,12 @@ class WorkerRegistry:
         return sum(w.free for w in self.alive(now))
 
 
-@dataclass
-class Placement:
-    job: Job
-    backend: str
-
-
-@dataclass
-class Plan:
-    placements: list[Placement] = field(default_factory=list)
-
-    def for_backend(self, backend: str) -> list[Job]:
-        return [p.job for p in self.placements if p.backend == backend]
-
-
 def local_capacity(workers: WorkerRegistry, dispatched_not_started: int, now: float | None = None) -> int:
     """
     Slots we can fill right now. Heartbeats lag behind dispatches, so jobs we already sent
     that no worker has reported as running yet are subtracted.
     """
     return max(0, workers.free_slots(now) - dispatched_not_started)
-
-
-def plan(queued: list[Job], workers: WorkerRegistry, dispatched_not_started: int,
-         now: float | None = None) -> Plan:
-    """Fill free local slots with queued jobs, in queue order (priority, then age)."""
-    capacity = local_capacity(workers, dispatched_not_started, now)
-    return Plan([Placement(job, "local") for job in queued[:capacity]])
 
 
 def estimate_wait_s(position: int, total_slots: int, free_slots: int, runtimes: list[float],

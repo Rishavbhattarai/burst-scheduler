@@ -5,28 +5,26 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import datetime
 import logging
 import os
 import statistics
 import time
-from collections import Counter, deque
+from collections import deque
 from contextlib import asynccontextmanager
-from dataclasses import asdict
 from pathlib import Path
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.staticfiles import StaticFiles
 from nats.errors import TimeoutError as NatsTimeoutError
-from pydantic import BaseModel, ConfigDict
+from pydantic import ValidationError
 
 from . import __version__, bus
 from .backends import CloudBackend, CloudStatus, create_backend
 from .config import Settings
 from .models import Job, JobEvent, JobState, JobSubmit, WorkerInfo
 from .policy import BudgetState, Offer, PolicyConfig, decide
-from .scheduler import WorkerRegistry, estimate_wait_s, plan
+from .scheduler import WorkerRegistry, estimate_wait_s, local_capacity
 from .store import JobStore
 
 log = logging.getLogger("burst.controller")
@@ -37,23 +35,8 @@ HISTORY_SAMPLES = 900   # 30 minutes
 
 
 def start_of_day(now: float) -> float:
-    """Midnight UTC of the day containing `now` (daily budgets reset then)."""
-    day = datetime.datetime.fromtimestamp(now, datetime.UTC).date()
-    return datetime.datetime.combine(day, datetime.time(), datetime.UTC).timestamp()
-
-
-class PolicyUpdate(BaseModel):
-    """PUT /policy body: any subset of the policy settings."""
-
-    model_config = ConfigDict(extra="forbid")
-    enabled: bool | None = None
-    burst_threshold_s: float | None = None
-    mode: str | None = None
-    value_per_hour: float | None = None
-    max_cloud_jobs: int | None = None
-    max_spend_per_hour: float | None = None
-    daily_budget: float | None = None
-    default_runtime_s: float | None = None
+    """Midnight UTC of the day containing `now` (daily budgets reset then; unix time has no leap seconds)."""
+    return now - now % 86400
 
 
 class Controller:
@@ -76,8 +59,10 @@ class Controller:
         await self.nc.subscribe(bus.HEARTBEAT, cb=self._on_heartbeat)
         self.events = await self.js.pull_subscribe(bus.EVENTS, durable=bus.CONTROLLER_CONSUMER,
                                                    stream=bus.EVENTS_STREAM)
-        self.tasks = [asyncio.create_task(self._event_loop()), asyncio.create_task(self._schedule_loop()),
-                      asyncio.create_task(self._cloud_loop()), asyncio.create_task(self._history_loop())]
+        self.tasks = [asyncio.create_task(self._event_loop()),
+                      asyncio.create_task(self._every(self.settings.schedule_interval_s, self.schedule_once)),
+                      asyncio.create_task(self._every(self.settings.cloud_poll_interval_s, self.poll_cloud_once)),
+                      asyncio.create_task(self._every(HISTORY_INTERVAL_S, self._record_sample))]
 
     async def stop(self) -> None:
         for task in self.tasks:
@@ -124,17 +109,16 @@ class Controller:
         """
         now = now or time.time()
         queued = self.store.queued()
-        local = plan(queued, self.workers, self.store.dispatched_not_started("local"), now)
-        for placement in local.placements:
-            job = placement.job
+        capacity = local_capacity(self.workers, self.store.dispatched_not_started("local"), now)
+        local, waiting = queued[:capacity], queued[capacity:]
+        for job in local:
             # Nats-Msg-Id lets JetStream drop a duplicate if we crash between publish and mark_dispatched
             await self.js.publish(bus.dispatch_subject("local"), job.model_dump_json().encode(),
                                   headers={"Nats-Msg-Id": job.id})
             self.store.mark_dispatched(job.id, "local", decision="free local slot")
-        placed = {p.job.id for p in local.placements}
-        bursted = await self._burst([j for j in queued if j.id not in placed], now)
+        bursted = await self._burst(waiting, now)
         self.workers.prune()
-        return len(placed) + bursted
+        return len(local) + bursted
 
     def budget_state(self, now: float) -> BudgetState:
         active = self.store.active_cloud_jobs()
@@ -152,19 +136,18 @@ class Controller:
                 self.store.set_decision(job.id, "waiting for a free local slot")
             return 0
 
-        alive = self.workers.alive(now)
-        total_slots = sum(w.slots for w in alive)
+        total_slots = self.workers.total_slots(now)
         runtimes = self.store.recent_runtimes()
         typical_runtime = statistics.median(runtimes) if runtimes else self.policy.default_runtime_s
         budget = self.budget_state(now)
-        per_backend = Counter(j.backend for j in self.store.active_cloud_jobs())
+        per_backend = self.store.active_by_backend()
 
         dispatched = 0
         position = 0   # position among the jobs that stay in the local queue
         for job in waiting:
             predicted = estimate_wait_s(position, total_slots, 0, runtimes, self.policy.default_runtime_s)
             offers = [
-                Offer(b.name, b.price_per_hour(job), b.startup_s, b.max_jobs - per_backend[b.name])
+                Offer(b.name, b.price_per_hour(job), b.startup_s, b.max_jobs - per_backend.get(b.name, 0))
                 for b in self.backends.values() if self.backend_cooldown.get(b.name, 0) <= now
             ]
             decision = decide(job, now, predicted, job.est_runtime_s or typical_runtime, offers, budget, self.policy)
@@ -191,7 +174,7 @@ class Controller:
             budget.active_cloud_jobs += 1
             budget.spend_rate_per_hour += decision.price_per_hour
             budget.spent_today += decision.cost_estimate
-            per_backend[backend.name] += 1
+            per_backend[backend.name] = per_backend.get(backend.name, 0) + 1
             dispatched += 1
         return dispatched
 
@@ -231,21 +214,14 @@ class Controller:
                 if job.external_id in statuses:
                     self._apply_cloud_status(job, statuses[job.external_id], now)
 
-    async def _cloud_loop(self) -> None:
+    async def _every(self, interval_s: float, step) -> None:
+        """Run `step` forever, `interval_s` apart; a failing step is logged and retried next time."""
         while True:
             try:
-                await self.poll_cloud_once()
+                await step()
             except Exception:
-                log.exception("cloud polling failed")
-            await asyncio.sleep(self.settings.cloud_poll_interval_s)
-
-    async def _schedule_loop(self) -> None:
-        while True:
-            try:
-                await self.schedule_once()
-            except Exception:
-                log.exception("scheduling failed")
-            await asyncio.sleep(self.settings.schedule_interval_s)
+                log.exception("%s failed", step.__name__)
+            await asyncio.sleep(interval_s)
 
     # -- history for the dashboard ---------------------------------------------------------------------
 
@@ -261,13 +237,8 @@ class Controller:
             "spend_rate_per_hour": cloud.spend_rate_per_hour,
         }
 
-    async def _history_loop(self) -> None:
-        while True:
-            try:
-                self.history.append(self.sample())
-            except Exception:
-                log.exception("sampling history failed")
-            await asyncio.sleep(HISTORY_INTERVAL_S)
+    async def _record_sample(self) -> None:
+        self.history.append(self.sample())
 
     # -- API helpers -----------------------------------------------------------------------------------
 
@@ -293,28 +264,25 @@ class Controller:
             await self.nc.publish(bus.CANCEL, job_id.encode())
         return self.store.get(job_id)
 
-    def update_policy(self, update: PolicyUpdate) -> PolicyConfig:
-        merged = {**asdict(self.policy), **update.model_dump(exclude_unset=True)}
+    def update_policy(self, update: dict) -> PolicyConfig:
         try:
-            self.policy = PolicyConfig(**merged)
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(422, str(exc)) from exc
+            self.policy = PolicyConfig(**{**self.policy.model_dump(), **update})
+        except ValidationError as exc:
+            raise HTTPException(422, exc.errors(include_url=False, include_context=False)) from exc
         return self.policy
 
     def stats(self, now: float | None = None) -> dict:
         now = now or time.time()
         queued = self.store.queued()
         waits = sorted(self.store.recent_waits(now=now))
-        alive = self.workers.alive(now)
-        total_slots = sum(w.slots for w in alive)
-        free_slots = sum(w.free for w in alive)
+        total_slots, free_slots = self.workers.total_slots(now), self.workers.free_slots(now)
         return {
             "counts": self.store.count_by_state(),
             "queue_depth": len(queued),
             "oldest_wait_s": max((j.wait_s(now) for j in queued), default=0.0),
             "wait_p50_s": statistics.median(waits) if waits else None,
             "wait_p95_s": waits[min(len(waits) - 1, int(0.95 * len(waits)))] if waits else None,
-            "workers": len(alive),
+            "workers": len(self.workers.alive(now)),
             "slots_total": total_slots,
             "slots_free": free_slots,
             # expected wait for a job submitted now, if it stays local
@@ -325,10 +293,9 @@ class Controller:
 
     def cloud_stats(self, now: float) -> dict:
         budget = self.budget_state(now)
-        active = Counter(j.backend for j in self.store.active_cloud_jobs())
         return {
             "active": budget.active_cloud_jobs,
-            "active_by_backend": dict(active),
+            "active_by_backend": {b: n for b, n in self.store.active_by_backend().items() if b != "local"},
             "spend_rate_per_hour": budget.spend_rate_per_hour,
             "spent_today": budget.spent_today,
             "daily_budget": self.policy.daily_budget,
@@ -394,16 +361,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/policy", dependencies=auth)
     async def get_policy() -> dict:
-        return asdict(controller.policy)
+        return controller.policy.model_dump()
 
     @app.put("/policy", dependencies=auth)
-    async def put_policy(update: PolicyUpdate) -> dict:
-        return asdict(controller.update_policy(update))
+    async def put_policy(update: dict) -> dict:
+        return controller.update_policy(update).model_dump()
 
     @app.get("/backends", dependencies=auth)
     async def list_backends() -> list[dict]:
-        active = Counter(j.backend for j in controller.store.active_cloud_jobs())
-        return [{**b.describe(), "active": active[b.name],
+        active = controller.store.active_by_backend()
+        return [{**b.describe(), "active": active.get(b.name, 0),
                  "cooling_down": controller.backend_cooldown.get(b.name, 0) > time.time()}
                 for b in controller.backends.values()]
 

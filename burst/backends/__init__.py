@@ -1,8 +1,8 @@
 """Cloud backends the scheduler can burst to."""
 
-from .base import CloudBackend, CloudStatus, Pricing
+from .base import CloudBackend, CloudStatus
 
-__all__ = ["CloudBackend", "CloudStatus", "Pricing", "create_backend"]
+__all__ = ["CloudBackend", "CloudStatus", "create_backend"]
 
 
 def create_backend(name: str, options: dict) -> CloudBackend:

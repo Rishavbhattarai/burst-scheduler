@@ -137,3 +137,10 @@ def test_value_per_hour_overrides_mode():
     assert PolicyConfig(mode="fastest").time_value_per_hour == math.inf
     with pytest.raises(ValueError):
         PolicyConfig(mode="yolo")
+    with pytest.raises(ValueError):
+        PolicyConfig(colour="red")   # typos in burst.toml are errors, not silently ignored
+
+
+def test_budget_day_starts_at_utc_midnight():
+    from burst.controller import start_of_day
+    assert start_of_day(1_790_000_000.0) == 1_789_948_800.0   # 2026-09-21 14:13:20 UTC

@@ -20,27 +20,28 @@ Every decision carries a human-readable reason, shown in the API and dashboard.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict
 
 from .models import Job
 
 MODES = {"cheapest": 0.0, "balanced": 2.0, "fastest": math.inf}
 
 
-@dataclass
-class PolicyConfig:
+class PolicyConfig(BaseModel):
+    """Validated on construction, so it doubles as the PUT /policy body and the [policy] TOML section."""
+
+    model_config = ConfigDict(extra="forbid")
     enabled: bool = True
     burst_threshold_s: float = 60.0
-    mode: str = "balanced"
+    mode: Literal["cheapest", "balanced", "fastest"] = "balanced"
     value_per_hour: float | None = None   # overrides the mode's value when set
     max_cloud_jobs: int = 10
     max_spend_per_hour: float = 5.0
     daily_budget: float = 50.0
     default_runtime_s: float = 60.0
-
-    def __post_init__(self) -> None:
-        if self.mode not in MODES:
-            raise ValueError(f"mode must be one of {sorted(MODES)}")
 
     @property
     def time_value_per_hour(self) -> float:
@@ -79,7 +80,6 @@ class _Candidate:
     cost: float
     meets_deadline: bool
     time_saved_s: float
-    net_benefit: float = field(default=0.0)
 
 
 def _fmt_s(seconds: float) -> str:
@@ -151,11 +151,9 @@ def decide(job: Job, now: float, predicted_remaining_local_s: float | None, runt
         # a time value of 0 makes any saving worthless, even an infinite one (avoid inf * 0 = nan)
         return 0.0 if rate == 0 else saved_s / 3600 * rate
 
-    for c in faster:
-        c.net_benefit = value_of(c.time_saved_s) - c.cost
-    best = max(faster, key=lambda c: (c.net_benefit, -c.cost))
-    if not best.net_benefit > 0:
-        value = value_of(best.time_saved_s)
+    best = max(faster, key=lambda c: (value_of(c.time_saved_s) - c.cost, -c.cost))
+    value = value_of(best.time_saved_s)
+    if not value - best.cost > 0:
         return Decision(None, f"saving {_fmt_s(best.time_saved_s)} is worth ${value:.4f}, less than "
                               f"${best.cost:.4f} on {best.offer.backend} ({config.mode} mode)", **base)
     return result(best, f"expected wait {_fmt_s(expected_wait)} ≥ {_fmt_s(config.burst_threshold_s)}: "

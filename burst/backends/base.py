@@ -7,17 +7,6 @@ from ..models import Job
 
 
 @dataclass
-class Pricing:
-    """On-demand style pricing: dollars per vCPU-hour plus dollars per GB-hour of memory."""
-
-    cpu_hour: float
-    gb_hour: float
-
-    def per_hour(self, job: Job) -> float:
-        return job.cpu * self.cpu_hour + job.memory_mb / 1024 * self.gb_hour
-
-
-@dataclass
 class CloudStatus:
     state: str                     # "pending" | "running" | "succeeded" | "failed"
     started_at: float | None = None
@@ -43,10 +32,12 @@ class CloudBackend(ABC):
         self.name = name
         self.startup_s = float(options.get("startup_s", 30))
         self.max_jobs = int(options.get("max_jobs", 10))
-        self.pricing = Pricing(float(options.get("cpu_hour", 0.05)), float(options.get("gb_hour", 0.005)))
+        # on-demand style: $ per vCPU-hour plus $ per GB-hour of memory
+        self.cpu_hour = float(options.get("cpu_hour", 0.05))
+        self.gb_hour = float(options.get("gb_hour", 0.005))
 
     def price_per_hour(self, job: Job) -> float:
-        return self.pricing.per_hour(job)
+        return job.cpu * self.cpu_hour + job.memory_mb / 1024 * self.gb_hour
 
     @abstractmethod
     def submit(self, job: Job) -> str:
@@ -65,4 +56,4 @@ class CloudBackend(ABC):
 
     def describe(self) -> dict:
         return {"name": self.name, "kind": self.kind, "startup_s": self.startup_s, "max_jobs": self.max_jobs,
-                "cpu_hour": self.pricing.cpu_hour, "gb_hour": self.pricing.gb_hour}
+                "cpu_hour": self.cpu_hour, "gb_hour": self.gb_hour}

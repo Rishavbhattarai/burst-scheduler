@@ -41,13 +41,6 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state, priority DESC, submitted_at);
 """
 
-COLUMNS = [
-    "id", "name", "command", "image", "cpu", "memory_mb", "est_runtime_s", "priority", "deadline_s",
-    "timeout_s", "state", "backend", "worker", "submitted_at", "dispatched_at", "started_at",
-    "finished_at", "exit_code", "error", "output_tail", "attempts",
-    "external_id", "price_per_hour", "cost_estimate", "cost", "decision",
-]
-
 # columns added after the first release: (name, SQL type)
 MIGRATIONS = [("external_id", "TEXT"), ("price_per_hour", "REAL"), ("cost_estimate", "REAL"), ("cost", "REAL"),
               ("decision", "TEXT")]
@@ -78,12 +71,8 @@ class JobStore:
         return self._to_job(row) if row else None
 
     def list(self, state: JobState | None = None, limit: int = 100) -> list[Job]:
-        if state is None:
-            rows = self.db.execute("SELECT * FROM jobs ORDER BY submitted_at DESC LIMIT ?", (limit,))
-        else:
-            rows = self.db.execute(
-                "SELECT * FROM jobs WHERE state = ? ORDER BY submitted_at DESC LIMIT ?", (state.value, limit)
-            )
+        rows = self.db.execute("SELECT * FROM jobs WHERE ?1 IS NULL OR state = ?1 ORDER BY submitted_at DESC LIMIT ?2",
+                               (state and state.value, limit))
         return [self._to_job(r) for r in rows]
 
     def queued(self) -> list[Job]:
@@ -134,9 +123,7 @@ class JobStore:
     def add(self, job: Job) -> Job:
         data = job.model_dump(mode="json")
         data["command"] = json.dumps(data["command"])
-        placeholders = ", ".join("?" for _ in COLUMNS)
-        self.db.execute(f"INSERT INTO jobs ({', '.join(COLUMNS)}) VALUES ({placeholders})",
-                        [data[c] for c in COLUMNS])
+        self.db.execute(f"INSERT INTO jobs ({', '.join(data)}) VALUES ({', '.join(':' + k for k in data)})", data)
         return job
 
     def _update(self, job_id: str, where_states: Iterable[JobState], **fields) -> bool:
@@ -152,9 +139,6 @@ class JobStore:
 
     def mark_dispatched(self, job_id: str, backend: str, now: float | None = None, **cloud) -> bool:
         """Queued -> dispatched. `cloud` can set external_id, price_per_hour, cost_estimate, decision."""
-        allowed = {"external_id", "price_per_hour", "cost_estimate", "decision"}
-        if not set(cloud) <= allowed:
-            raise TypeError(f"unexpected fields {set(cloud) - allowed}")
         return self._update(
             job_id, [JobState.QUEUED],
             state=JobState.DISPATCHED, backend=backend, dispatched_at=now or time.time(), **cloud,

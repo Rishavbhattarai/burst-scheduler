@@ -1,15 +1,11 @@
 import pytest
 
-from burst.models import Job, WorkerInfo
-from burst.scheduler import WorkerRegistry, estimate_wait_s, local_capacity, plan
+from burst.models import WorkerInfo
+from burst.scheduler import WorkerRegistry, estimate_wait_s, local_capacity
 
 
 def worker(wid: str, slots: int, running: int = 0) -> WorkerInfo:
     return WorkerInfo(id=wid, slots=slots, running=[f"j{i}" for i in range(running)])
-
-
-def jobs(n: int) -> list[Job]:
-    return [Job(command=["true"], submitted_at=i) for i in range(n)]
 
 
 def test_registry_counts_only_live_workers():
@@ -31,21 +27,6 @@ def test_capacity_subtracts_jobs_dispatched_but_not_started():
     assert local_capacity(reg, dispatched_not_started=0, now=100) == 3
     assert local_capacity(reg, dispatched_not_started=2, now=100) == 1
     assert local_capacity(reg, dispatched_not_started=10, now=100) == 0
-
-
-def test_plan_fills_free_slots_in_queue_order():
-    reg = WorkerRegistry()
-    reg.update(worker("a", 2), now=100)
-    reg.update(worker("b", 3, running=2), now=100)
-    queued = jobs(10)
-    decision = plan(queued, reg, dispatched_not_started=0, now=100)
-    assert [p.job.id for p in decision.placements] == [j.id for j in queued[:3]]
-    assert all(p.backend == "local" for p in decision.placements)
-    assert decision.for_backend("local") == queued[:3]
-
-
-def test_plan_without_workers_dispatches_nothing():
-    assert plan(jobs(3), WorkerRegistry(), 0).placements == []
 
 
 @pytest.mark.parametrize("position, expected", [
